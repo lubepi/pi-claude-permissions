@@ -2,8 +2,8 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type PermissionAction = "allow" | "ask" | "deny";
 
@@ -181,9 +181,93 @@ function bashTargetCandidates(command: string): string[] {
   return dedupe([
     trimmed,
     withoutEnv,
+    trimmed + " ",
+    withoutEnv + " ",
     ...unwrapKnownBashWrappers(trimmed),
     ...unwrapKnownBashWrappers(withoutEnv),
   ]);
+}
+
+/**
+ * Split a bash command into individual segments at |, &&, ||, ;
+ * while respecting single and double quotes.
+ */
+export function bashCommandSegments(command: string): string[] {
+  const segments: string[] = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  let i = 0;
+
+  while (i < command.length) {
+    const ch = command[i];
+
+    if (ch === "\\" && i + 1 < command.length) {
+      current += ch + command[i + 1];
+      i += 2;
+      continue;
+    }
+
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      current += ch;
+      i++;
+      continue;
+    }
+
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      current += ch;
+      i++;
+      continue;
+    }
+
+    if (!inSingle && !inDouble) {
+      // Check for ;; (end of case arm, treat as separator)
+      if (ch === ";" && i + 1 < command.length && command[i + 1] === ";") {
+        segments.push(current.trim());
+        current = "";
+        i += 2;
+        continue;
+      }
+      if (ch === ";") {
+        segments.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+      // Check for ||
+      if (ch === "|" && i + 1 < command.length && command[i + 1] === "|") {
+        segments.push(current.trim());
+        current = "";
+        i += 2;
+        continue;
+      }
+      // Check for | (pipe)
+      if (ch === "|") {
+        segments.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+      // Check for &&
+      if (ch === "&" && i + 1 < command.length && command[i + 1] === "&") {
+        segments.push(current.trim());
+        current = "";
+        i += 2;
+        continue;
+      }
+    }
+
+    current += ch;
+    i++;
+  }
+
+  if (current.trim()) {
+    segments.push(current.trim());
+  }
+
+  return segments.filter(Boolean);
 }
 
 export function toolTarget(event: { toolName: string; input: Record<string, any>; cwd: string }): RuleTarget {
@@ -594,15 +678,76 @@ export default function toolPermissionsExtension(pi: ExtensionAPI) {
     ctx.ui.notify(`claude-permissions: default=${defaultAction}, tool_search allowed`, "info");
   });
 
+  function evaluateBashSegments(command: string, ctx: any): Promise<{ allow: boolean; blockReason?: string }> {
+    const segments = bashCommandSegments(command);
+
+    // Evaluate each segment independently
+    const results = segments.map((seg) => {
+      const segInput: Record<string, any> = { command: seg };
+      const target = toolTarget({ toolName: "bash", input: segInput, cwd: ctx.cwd });
+      const paths = buildPaths(ctx.cwd);
+      const globalConfig = readConfig(paths.global, DEFAULT_GLOBAL_CONFIG);
+      const projectConfig = readConfig(paths.project);
+      const effectiveProjectConfig = sessionDefaultAction ? { ...projectConfig, defaultAction: sessionDefaultAction } : projectConfig;
+      return { seg, decision: evaluateRules(sessionRules, effectiveProjectConfig, globalConfig, "bash", target), paths };
+    });
+
+    // Most restrictive action wins: deny > ask > allow
+    const denyResult = results.find(r => r.decision.action === "deny");
+    if (denyResult) {
+      const reason = denyResult.decision.rule
+        ? `Blocked by ${denyResult.decision.source} deny rule: ${denyResult.decision.rule} (in segment: ${denyResult.seg})`
+        : `Blocked by ${denyResult.decision.source} deny policy (in segment: ${denyResult.seg})`;
+      return { allow: false, blockReason: `${reason}\nFull command: ${command}` };
+    }
+
+    const askResult = results.find(r => r.decision.action === "ask");
+    if (askResult) {
+      const callText = `bash → ${command}`;
+      const exactRule = `bash:${askResult.seg}`;
+      const decision = askResult.decision;
+      const paths = askResult.paths;
+
+      if (!ctx.hasUI) {
+        return {
+          allow: false,
+          blockReason: [
+            `Blocked in non-interactive mode.`,
+            `Decision: ask (segment: ${askResult.seg})`,
+            `Call: ${callText}`,
+            `Add allow rule: ${exactRule}`,
+            `Project config: ${paths.project}`,
+            `Global config: ${paths.global}`,
+          ].join("\n"),
+        };
+      }
+
+      return promptForDecision(ctx, paths, sessionRules, { ...decision, rule: decision.rule ?? "bash:*" }, callText, exactRule);
+    }
+
+    // All segments are allowed
+    return { allow: true };
+  }
+
   pi.on("tool_call", async (event, ctx) => {
     const toolName = event.toolName;
     const input = (event.input ?? {}) as Record<string, any>;
     if (!enabled) return undefined;
 
-    const target = toolTarget({ toolName, input, cwd: ctx.cwd });
     const paths = buildPaths(ctx.cwd);
-    const globalConfig = readConfig(paths.global, DEFAULT_GLOBAL_CONFIG);
     const projectConfig = readConfig(paths.project);
+
+    if (toolName === "bash") {
+      const command = String(input.command ?? "").trim();
+      const result = await evaluateBashSegments(command, ctx);
+      updateStatus(ctx, enabled, projectConfig.footerStatus ?? readConfig(paths.global, DEFAULT_GLOBAL_CONFIG).footerStatus ?? true);
+      if (result.allow) return undefined;
+      return { block: true, reason: result.blockReason ?? "Cancelled by user" };
+    }
+
+    // Non-bash tools: use existing logic
+    const target = toolTarget({ toolName, input, cwd: ctx.cwd });
+    const globalConfig = readConfig(paths.global, DEFAULT_GLOBAL_CONFIG);
     const effectiveProjectConfig = sessionDefaultAction ? { ...projectConfig, defaultAction: sessionDefaultAction } : projectConfig;
     const decision = evaluateRules(sessionRules, effectiveProjectConfig, globalConfig, toolName, target);
     const callText = displayCall({ toolName, input, cwd: ctx.cwd });
